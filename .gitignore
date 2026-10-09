@@ -1,0 +1,19 @@
+# Local reference copies are outside this repository; keep them out if copied back.
+Sakura-app/
+Sakura-source/
+
+# Python and editor artifacts anywhere in the tree.
+**/.venv/
+**/.uv-cache/
+**/python-runtime/
+**/__pycache__/
+**/.pytest_cache/
+**/.vscode/
+
+# Local model data, recordings, account credentials and personal settings.
+**/models/
+**/samples/*.wav
+**/.env
+**/.env.*
+**/llm_settings.json
+**/settings.json

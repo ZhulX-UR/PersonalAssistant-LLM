@@ -1,0 +1,9 @@
+.venv/
+.uv-cache/
+python-runtime/
+models/
+__pycache__/
+.env.local
+llm_settings.json
+settings.json
+samples/*.wav

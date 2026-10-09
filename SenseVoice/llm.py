@@ -1,0 +1,119 @@
+"""Small, independent chat-completions client for Shimano's LLM exercise."""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env.local"
+SETTINGS_FILE = ROOT / "llm_settings.json"
+SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+DEFAULT_PROMPT = "你是爱莉，一位温暖、可靠的桌面伙伴。用自然简洁的中文回应用户。不要声称已经执行你没有执行的操作。"
+PROVIDERS = {"siliconflow": "硅基流动", "custom": "自定义兼容接口"}
+KEY_NAMES = {"siliconflow": "SILICONFLOW_API_KEY", "custom": "SHIMANO_CUSTOM_API_KEY"}
+
+
+@dataclass(frozen=True)
+class LlmSettings:
+    provider: str = "siliconflow"
+    base_url: str = SILICONFLOW_URL
+    model: str = DEFAULT_MODEL
+    system_prompt: str = DEFAULT_PROMPT
+
+    def validated(self) -> "LlmSettings":
+        if self.provider not in PROVIDERS:
+            raise ValueError("不支持的模型供应商")
+        if not self.model.strip():
+            raise ValueError("请填写模型 ID")
+        url = self.base_url.strip().rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("API 地址须为 http(s) Base URL，且不能包含密钥或查询参数")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("远程 API 地址必须使用 HTTPS")
+        if self.provider == "siliconflow" and url != SILICONFLOW_URL:
+            raise ValueError("硅基流动地址应为官方 API 地址")
+        return LlmSettings(self.provider, url, self.model.strip(), self.system_prompt.strip())
+
+
+def load_settings() -> LlmSettings:
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return LlmSettings(**{key: data[key] for key in ("provider", "base_url", "model", "system_prompt") if key in data}).validated()
+    except (OSError, ValueError, TypeError, KeyError):
+        return LlmSettings()
+
+
+def save_settings(settings: LlmSettings) -> None:
+    from dataclasses import asdict
+    settings = settings.validated()
+    temporary = SETTINGS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(asdict(settings), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, SETTINGS_FILE)
+
+
+def load_key(provider: str) -> str:
+    name = KEY_NAMES[provider]
+    if not ENV_FILE.is_file():
+        return ""
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == name:
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def save_key(provider: str, key: str) -> None:
+    """Replace only this provider's key; never put it in the settings JSON."""
+    name = KEY_NAMES[provider]
+    value = key.strip()
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError("API Key 不能为空，也不能包含换行")
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    lines = [line for line in lines if line.partition("=")[0].strip() != name]
+    lines.append(f"{name}={value}")
+    temporary = ENV_FILE.with_suffix(".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temporary, ENV_FILE)
+
+
+def chat(settings: LlmSettings, key: str, history: list[dict[str, str]], user_text: str, *, timeout: float = 60) -> str:
+    settings = settings.validated()
+    if not user_text.strip():
+        raise ValueError("请先输入消息")
+    if not key and settings.provider == "siliconflow":
+        raise ValueError("请先输入并保存硅基流动 API Key")
+    messages = []
+    if settings.system_prompt:
+        messages.append({"role": "system", "content": settings.system_prompt})
+    messages.extend(history[-12:])
+    messages.append({"role": "user", "content": user_text.strip()})
+    payload = json.dumps({"model": settings.model, "messages": messages, "stream": False}, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(settings.base_url + "/chat/completions", data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(2_000_001)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"模型服务返回 HTTP {error.code}；请检查密钥、模型 ID 和账户额度") from None
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise RuntimeError(f"无法连接模型服务：{getattr(error, 'reason', '请求超时')}") from None
+    if len(body) > 2_000_000:
+        raise RuntimeError("模型响应过大")
+    try:
+        content = json.loads(body)["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise RuntimeError("模型返回格式不符合 chat/completions 协议") from None
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("模型没有返回可显示的文字")
+    return content.strip()

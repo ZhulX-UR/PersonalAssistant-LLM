@@ -1,0 +1,13 @@
+# 第三方来源与发布边界
+
+本仓库只保存 Shimano 原型源码与说明，不包含 Sakura 的完整源码或便携版，也不提交本地模型权重、词表和音频样本。
+
+| 项目或资源 | 在本项目中的用途 | 来源和许可线索 |
+| --- | --- | --- |
+| Sakura 的 SenseVoice 插件 | `SenseVoice/recognize.py` 的 VAD / 解码流程参考 | [Sakura 仓库](https://github.com/Rvosy/Sakura)，MIT；保留许可文本于 `SenseVoice/third_party/Sakura-LICENSE.txt` |
+| sherpa-onnx | SenseVoice、Silero VAD 的本地推理运行时 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)，Apache-2.0 |
+| SenseVoiceSmall INT8 与 `tokens.txt` | 本地语音识别模型 | [固定版本的 ONNX 转换文件](https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tree/2365baeacb507f821a0c8120fcee3d484dba7a07)；模型权重另受 [FunASR 模型许可](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE) 约束 |
+| Silero VAD | 检测语音片段 | [Silero VAD](https://github.com/snakers4/silero-vad)，MIT；ONNX 文件由 [sherpa-onnx release](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx) 提供 |
+| `zh.wav` 示例 | 可选的本地识别测试音频 | [固定版本的测试音频目录](https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tree/2365baeacb507f821a0c8120fcee3d484dba7a07/test_wavs)；不随仓库发布 |
+
+运行依赖版本见 `SenseVoice/requirements.txt`。这些软件和资源各有自己的许可；此处保留来源供协作者核对，尤其是在打包分发模型文件之前。
