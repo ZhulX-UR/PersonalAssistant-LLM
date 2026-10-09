@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from continuous import StreamingVad
 from chat_worker import ChatWorker
+from interaction import InteractionState, likely_playback_echo, speech_chunks
 from llm import load_key, load_settings
 from recognize import ROOT, create_recognizer, decode_segment, read_wav, recognize
 from wake import ConversationGate, DEFAULT_ALIASES, DEFAULT_NAME, TRAILING, parse_aliases
@@ -180,11 +181,21 @@ class MainWindow(QMainWindow):
         self.wake_timer.timeout.connect(self.update_wake_status)
         self.gate: ConversationGate | None = None
         self.speech_started_at: float | None = None
+        self.speech_started_during_playback = False
+        self.interaction_state = InteractionState.IDLE
         self.chat_history: list[dict[str, str]] = []
         self.chat_worker: ChatWorker | None = None
+        self.chat_workers: dict[int, ChatWorker] = {}
+        self.turn_serial = 0
+        self.active_turn: int | None = None
         self.pending_message = ""
         self.conversation_busy = False
         self.tts_pending = False
+        self.tts_chunks: list[str] = []
+        self.spoken_answer = ""
+        self.current_tts_chunk = ""
+        self.tts_advance_pending = False
+        self.echo_guard_until = 0.0
         self.llm_window = None
         engines = QTextToSpeech.availableEngines()
         self.tts = QTextToSpeech("winrt" if "winrt" in engines else "sapi", self) if engines else None
@@ -268,6 +279,14 @@ class MainWindow(QMainWindow):
         self.voice_combo.currentIndexChanged.connect(self.select_voice)
         self.speak_reply.toggled.connect(self.voice_combo.setEnabled)
         form.addRow("发音人", self.voice_combo)
+        self.barge_in_mode = QComboBox()
+        self.barge_in_mode.addItem("扬声器：说唤醒名后打断", "speakers")
+        self.barge_in_mode.addItem("耳机：检测到说话立即打断", "headphones")
+        mode_index = self.barge_in_mode.findData(saved["barge_in_mode"])
+        if mode_index >= 0:
+            self.barge_in_mode.setCurrentIndex(mode_index)
+        self.barge_in_mode.currentIndexChanged.connect(self.save_wake_settings)
+        form.addRow("语音打断", self.barge_in_mode)
         self.model_button = QPushButton("模型设置与文字测试…")
         self.model_button.clicked.connect(self.open_model_settings)
         form.addRow("模型", self.model_button)
@@ -294,6 +313,14 @@ class MainWindow(QMainWindow):
         self.continuous_button.setObjectName("continuousButton")
         self.continuous_button.clicked.connect(self.toggle_continuous)
         layout.addWidget(self.continuous_button)
+
+        self.interrupt_button = QPushButton("立即停止当前回复")
+        self.interrupt_button.setEnabled(False)
+        self.interrupt_button.clicked.connect(self.interrupt_reply)
+        layout.addWidget(self.interrupt_button)
+
+        self.state_label = QLabel("状态：Idle")
+        layout.addWidget(self.state_label)
 
         self.status_label = QLabel("就绪 · 录音最长 60 秒")
         self.status_label.setObjectName("statusLabel")
@@ -341,7 +368,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def load_wake_settings() -> dict:
         defaults = {"name": DEFAULT_NAME, "aliases": DEFAULT_ALIASES, "timeout": 30,
-                    "auto_reply": True, "speak_reply": True, "voice_name": "Microsoft Yaoyao"}
+                    "auto_reply": True, "speak_reply": True, "voice_name": "Microsoft Yaoyao",
+                    "barge_in_mode": "speakers"}
         try:
             data = json.loads(SETTINGS.read_text(encoding="utf-8"))
             return {
@@ -351,6 +379,7 @@ class MainWindow(QMainWindow):
                 "auto_reply": bool(data.get("auto_reply", True)),
                 "speak_reply": bool(data.get("speak_reply", True)),
                 "voice_name": str(data.get("voice_name", "Microsoft Yaoyao")),
+                "barge_in_mode": str(data.get("barge_in_mode", "speakers")),
             }
         except (OSError, ValueError, TypeError, AttributeError):
             return defaults
@@ -362,7 +391,8 @@ class MainWindow(QMainWindow):
             self.wake_name.setText(name)
         data = {"name": name, "aliases": self.wake_aliases.text().strip(), "timeout": self.wake_timeout.value(),
                 "auto_reply": self.auto_reply.isChecked(), "speak_reply": self.speak_reply.isChecked(),
-                "voice_name": self.voice_combo.currentText()}
+                "voice_name": self.voice_combo.currentText(),
+                "barge_in_mode": self.barge_in_mode.currentData()}
         try:
             SETTINGS.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         except OSError as error:
@@ -372,6 +402,12 @@ class MainWindow(QMainWindow):
     def select_voice(self) -> None:
         if self.tts is not None and self.voice_combo.currentData() is not None:
             self.tts.setVoice(self.voice_combo.currentData())
+
+    def set_interaction_state(self, state: InteractionState) -> None:
+        self.interaction_state = state
+        self.conversation_busy = state in (InteractionState.THINKING, InteractionState.SPEAKING)
+        self.state_label.setText(f"状态：{state.value}")
+        self.interrupt_button.setEnabled(self.conversation_busy)
 
     @Slot()
     def open_model_settings(self) -> None:
@@ -492,6 +528,7 @@ class MainWindow(QMainWindow):
             self.wake_name.text(), parse_aliases(self.wake_aliases.text()), self.wake_timeout.value()
         )
         self.speech_started_at = None
+        self.speech_started_during_playback = False
         self.result_edit.clear()
         self.copy_button.setEnabled(False)
         self.record_button.setEnabled(False)
@@ -538,11 +575,12 @@ class MainWindow(QMainWindow):
             worker.request_stop()
             return
         self.wake_timer.start()
+        self.set_interaction_state(InteractionState.LISTENING)
         self.update_wake_status()
 
     def receive_continuous_audio(self, input_data, _frames, _time, status) -> None:
         worker = self.continuous_worker
-        if worker is None or self.conversation_busy:
+        if worker is None:
             return
         if status:
             worker.failed.emit(f"录音设备报告错误：{status}")
@@ -552,18 +590,57 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def continuous_voice_started(self) -> None:
-        if self.continuous_worker is not None and not self.conversation_busy:
-            self.speech_started_at = time.monotonic()
+        if self.continuous_worker is None:
+            return
+        self.speech_started_at = time.monotonic()
+        self.speech_started_during_playback = (
+            self.interaction_state == InteractionState.SPEAKING
+            or self.speech_started_at < self.echo_guard_until
+        )
+        if self.interaction_state == InteractionState.SPEAKING:
+            if self.barge_in_mode.currentData() == "headphones":
+                self.interrupt_reply()
+                self.status_label.setText("已打断播报 · 正在听你说话")
+            else:
+                self.status_label.setText("听到声音 · 请说唤醒名以打断播报")
+        elif self.interaction_state == InteractionState.THINKING:
+            self.status_label.setText("听到补充 · 正在收集这一句")
+        else:
             self.status_label.setText("检测到说话 · 正在收集这一句")
 
     @Slot()
     def continuous_voice_ended(self) -> None:
-        if self.continuous_worker is not None and not self.conversation_busy:
+        if self.continuous_worker is not None:
             self.status_label.setText("说话结束 · 正在识别")
 
     @Slot(str, str)
     def continuous_result(self, text: str, language: str) -> None:
-        if self.gate is None or self.conversation_busy:
+        if self.gate is None or self.continuous_worker is None or self.continuous_worker.stop_requested.is_set():
+            return
+        if not text.strip():
+            self.speech_started_at = None
+            self.speech_started_during_playback = False
+            return
+        started_during_playback = self.speech_started_during_playback
+        self.speech_started_during_playback = False
+        if self.interaction_state == InteractionState.SPEAKING or started_during_playback:
+            if likely_playback_echo(text, self.spoken_answer):
+                self.speech_started_at = None
+                self.status_label.setText("已过滤扬声器回声 · 继续播报")
+                return
+            if self.barge_in_mode.currentData() == "speakers":
+                # During loudspeaker playback, require the name before acting on
+                # ASR output; a bare VAD event may just be our own speaker.
+                leading = text.lstrip(" \t\r\n，,。.!！?？：:、")
+                if not any(leading.startswith(alias) and not leading[len(alias):].startswith("丝") for alias in self.gate.aliases):
+                    self.speech_started_at = None
+                    return
+            if self.interaction_state == InteractionState.SPEAKING:
+                self.interrupt_reply()
+        elif self.interaction_state == InteractionState.THINKING:
+            self.interrupt_reply()
+        elif time.monotonic() < self.echo_guard_until and likely_playback_echo(text, self.spoken_answer):
+            self.speech_started_at = None
             return
         result = self.gate.process(text, now=self.speech_started_at)
         self.speech_started_at = None
@@ -583,99 +660,161 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"对话中 · 已识别一句（{language or '语言未知'}）")
 
     def begin_chat_turn(self, message: str) -> None:
-        if self.chat_worker is not None or self.continuous_worker is None:
+        if self.continuous_worker is None or self.interaction_state != InteractionState.LISTENING:
             return
         settings = load_settings()
         key = load_key(settings.provider)
         if settings.provider == "siliconflow" and not key:
             self.status_label.setText("请先在“模型设置与文字测试”中保存 API Key")
             return
-        self.conversation_busy = True
+        self.turn_serial += 1
+        turn = self.turn_serial
+        self.active_turn = turn
         self.pending_message = message
         self.speech_started_at = None
-        self.continuous_worker.pause()
-        if self.continuous_stream is not None:
-            try:
-                self.continuous_stream.stop()
-            except Exception as error:
-                self.conversation_busy = False
-                self.continuous_worker.resume()
-                self.status_label.setText(f"暂停麦克风失败：{error}")
-                return
-        self.chat_worker = ChatWorker(settings, key, list(self.chat_history), message, self)
-        self.chat_worker.replied.connect(self.chat_replied)
-        self.chat_worker.failed.connect(self.chat_failed)
-        self.chat_worker.finished.connect(self.chat_finished)
+        self.set_interaction_state(InteractionState.THINKING)
+        worker = ChatWorker(settings, key, list(self.chat_history), message, self)
+        self.chat_worker = worker
+        self.chat_workers[turn] = worker
+        worker.replied.connect(lambda reply, turn=turn: self.chat_replied(turn, reply))
+        worker.failed.connect(lambda error, turn=turn: self.chat_failed(turn, error))
+        worker.finished.connect(lambda turn=turn: self.chat_finished(turn))
         self.status_label.setText("已将识别文字发送给模型 · 等待回复")
-        self.chat_worker.start()
+        worker.start()
 
-    @Slot(str)
-    def chat_replied(self, reply: str) -> None:
-        if not self.conversation_busy:
+    def chat_replied(self, turn: int, reply: str) -> None:
+        if turn != self.active_turn or self.interaction_state != InteractionState.THINKING:
+            return
+        if self.speech_started_at is not None:
+            # A new utterance began before the network reply arrived. Let the
+            # recognizer finish it instead of speaking over the user.
+            self.active_turn = None
+            self.chat_worker = None
+            self.pending_message = ""
+            self.set_interaction_state(InteractionState.LISTENING)
+            self.status_label.setText("你正在说话 · 已忽略刚收到的旧回复")
             return
         self.chat_history.extend(({"role": "user", "content": self.pending_message},
                                   {"role": "assistant", "content": reply}))
         self.chat_history = self.chat_history[-12:]
+        self.active_turn = None
+        self.chat_worker = None
+        self.pending_message = ""
         self.result_edit.appendPlainText(f"爱莉：{reply}\n")
         if self.speak_reply.isChecked() and self.tts is not None:
-            self.tts_pending = True
-            self.status_label.setText("爱莉正在说话 · 麦克风暂停")
-            try:
-                self.tts.say(reply)
-                QTimer.singleShot(150, self.check_tts_state)
-            except Exception as error:
-                self.tts_pending = False
-                self.result_edit.appendPlainText(f"系统：语音播报失败：{error}\n")
+            self.tts_chunks = speech_chunks(reply, limit=42 if self.barge_in_mode.currentData() == "speakers" else 90)
+            self.spoken_answer = reply
+            if self.tts_chunks:
+                self.tts_pending = True
+                self.set_interaction_state(InteractionState.SPEAKING)
+                self.speak_next_chunk()
+            else:
+                self.finish_chat_turn()
         else:
             self.status_label.setText("模型回复完成")
+            self.finish_chat_turn()
 
-    @Slot(str)
-    def chat_failed(self, error: str) -> None:
-        if self.conversation_busy:
-            self.result_edit.appendPlainText(f"系统：模型请求失败：{error}\n")
-            self.status_label.setText(f"模型请求失败：{error}")
+    def speak_next_chunk(self) -> None:
+        if not self.tts_pending or self.interaction_state != InteractionState.SPEAKING:
+            return
+        if self.speech_started_at is not None:
+            QTimer.singleShot(100, self.speak_next_chunk)
+            return
+        self.tts_advance_pending = False
+        if not self.tts_chunks:
+            self.tts_pending = False
+            self.finish_chat_turn()
+            return
+        self.current_tts_chunk = self.tts_chunks.pop(0)
+        self.status_label.setText(f"爱莉正在分段说话 · 剩余 {len(self.tts_chunks)} 段")
+        try:
+            self.tts.say(self.current_tts_chunk)
+            QTimer.singleShot(150, self.check_tts_state)
+        except Exception as error:
+            self.tts_pending = False
+            self.result_edit.appendPlainText(f"系统：语音播报失败：{error}\n")
+            self.finish_chat_turn()
 
-    @Slot()
-    def chat_finished(self) -> None:
-        worker = self.chat_worker
+    def chat_failed(self, turn: int, error: str) -> None:
+        if turn != self.active_turn:
+            return
+        self.active_turn = None
         self.chat_worker = None
+        self.pending_message = ""
+        self.result_edit.appendPlainText(f"系统：模型请求失败：{error}\n")
+        self.status_label.setText(f"模型请求失败：{error}")
+        self.finish_chat_turn()
+
+    def chat_finished(self, turn: int) -> None:
+        worker = self.chat_workers.pop(turn, None)
         if worker is not None:
             worker.deleteLater()
-        if self.conversation_busy and not self.tts_pending:
+        if turn == self.active_turn:
+            self.active_turn = None
+            self.chat_worker = None
+            self.pending_message = ""
             self.finish_chat_turn()
 
     @Slot()
     def check_tts_state(self) -> None:
-        if self.tts_pending and self.tts is not None and self.tts.state() in (QTextToSpeech.State.Ready, QTextToSpeech.State.Error):
+        if self.tts_pending and self.interaction_state == InteractionState.SPEAKING and self.tts is not None and self.tts.state() in (QTextToSpeech.State.Ready, QTextToSpeech.State.Error):
             self.tts_state_changed(self.tts.state())
 
     @Slot(QTextToSpeech.State)
     def tts_state_changed(self, state) -> None:
-        if not self.tts_pending:
+        if not self.tts_pending or self.interaction_state != InteractionState.SPEAKING:
             return
         if state in (QTextToSpeech.State.Ready, QTextToSpeech.State.Error):
-            self.tts_pending = False
             if state == QTextToSpeech.State.Error and hasattr(self, "status_label"):
+                self.tts_pending = False
                 self.result_edit.appendPlainText("系统：语音播报失败；文字回复仍可查看\n")
                 self.status_label.setText("语音播报失败；文字回复仍可查看")
-            if self.chat_worker is None:
                 self.finish_chat_turn()
+            else:
+                if not self.tts_advance_pending:
+                    self.tts_advance_pending = True
+                    # A short gap lets the 0.8 s VAD silence timer close a
+                    # segment before the next sentence feeds speaker echo.
+                    delay = 1100 if self.barge_in_mode.currentData() == "speakers" and self.tts_chunks else 0
+                    QTimer.singleShot(delay, self.speak_next_chunk)
+
+    @Slot()
+    def interrupt_reply(self) -> None:
+        if self.interaction_state == InteractionState.THINKING:
+            # urllib may still be waiting for the old reply. Its turn token makes
+            # that reply stale, so it cannot enter history or start playback.
+            self.active_turn = None
+            self.chat_worker = None
+            self.pending_message = ""
+        elif self.interaction_state == InteractionState.SPEAKING:
+            self.tts_pending = False
+            self.tts_advance_pending = False
+            self.tts_chunks.clear()
+            self.current_tts_chunk = ""
+            self.echo_guard_until = time.monotonic() + 0.8
+            if self.tts is not None:
+                self.tts.stop()
+        else:
+            return
+        self.set_interaction_state(InteractionState.LISTENING)
+        if self.gate is not None:
+            self.gate.touch()
+        self.status_label.setText("当前回复已打断 · 正在听你说话")
 
     def finish_chat_turn(self) -> None:
-        self.conversation_busy = False
+        if self.interaction_state == InteractionState.SPEAKING:
+            self.echo_guard_until = time.monotonic() + 0.8
+        self.tts_pending = False
+        self.tts_advance_pending = False
+        self.tts_chunks.clear()
+        self.current_tts_chunk = ""
         self.pending_message = ""
         if self.continuous_worker is None or self.continuous_worker.stop_requested.is_set():
+            self.set_interaction_state(InteractionState.IDLE)
             return
         if self.gate is not None:
             self.gate.active_until = time.monotonic() + self.gate.timeout
-        self.continuous_worker.resume()
-        try:
-            if self.continuous_stream is not None:
-                self.continuous_stream.start()
-        except Exception as error:
-            self.stop_continuous()
-            self.status_label.setText(f"恢复麦克风失败：{error}")
-            return
+        self.set_interaction_state(InteractionState.LISTENING)
         self.update_wake_status()
 
     @Slot()
@@ -697,11 +836,16 @@ class MainWindow(QMainWindow):
 
     def stop_continuous(self) -> None:
         self.wake_timer.stop()
-        self.conversation_busy = False
+        self.active_turn = None
+        self.chat_worker = None
         self.tts_pending = False
+        self.tts_advance_pending = False
+        self.tts_chunks.clear()
         self.pending_message = ""
+        self.speech_started_during_playback = False
         if self.tts is not None:
             self.tts.stop()
+        self.set_interaction_state(InteractionState.IDLE)
         self.continuous_button.setEnabled(False)
         stream = self.continuous_stream
         self.continuous_stream = None
@@ -720,8 +864,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def continuous_finished(self) -> None:
         self.wake_timer.stop()
+        self.set_interaction_state(InteractionState.IDLE)
         self.gate = None
         self.speech_started_at = None
+        self.speech_started_during_playback = False
         worker = self.continuous_worker
         self.continuous_worker = None
         if self.continuous_stream is not None:
@@ -811,7 +957,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.wake_timer.stop()
-        self.conversation_busy = False
+        self.active_turn = None
         self.tts_pending = False
         if self.tts is not None:
             self.tts.stop()
@@ -830,8 +976,9 @@ class MainWindow(QMainWindow):
         if self.continuous_worker is not None and self.continuous_worker.isRunning():
             self.continuous_worker.request_stop()
             self.continuous_worker.wait()
-        if self.chat_worker is not None and self.chat_worker.isRunning():
-            self.chat_worker.wait()
+        for worker in tuple(self.chat_workers.values()):
+            if worker.isRunning():
+                worker.wait()
         super().closeEvent(event)
 
 

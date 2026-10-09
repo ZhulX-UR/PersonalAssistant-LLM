@@ -1,6 +1,6 @@
 # Shimano
 
-Shimano 是一个正在开发的个人语音助手。当前可运行的部分位于 `SenseVoice/`：它能持续监听、用本地 VAD 截取语音、本地识别文字、按“爱莉”唤醒、调用兼容 OpenAI Chat Completions 的模型接口，并用系统语音朗读回复。
+Shimano 是一个正在开发的个人语音助手。当前可运行的部分位于 `SenseVoice/`：它能持续监听、用本地 VAD 截取语音、本地识别文字、按“爱莉”唤醒、调用兼容 OpenAI Chat Completions 的模型接口，并用系统语音分段朗读回复。界面显示 `Listening / Thinking / Speaking`；播报时可用唤醒称呼插话打断。
 
 | 目录 | 用途 | 当前运行是否依赖 |
 | --- | --- | --- |

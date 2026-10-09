@@ -12,6 +12,7 @@ Shimano/
 │  ├─ continuous.py          流式 Silero VAD，分段与句尾检测
 │  ├─ recognize.py           SenseVoice 本地识别及命令行入口
 │  ├─ wake.py                唤醒别名校正、对话时间窗
+│  ├─ interaction.py         交互状态、分段播报与回声文本过滤
 │  ├─ llm.py                 模型配置、密钥读取和 HTTP 请求
 │  ├─ chat_worker.py         模型请求的 Qt 后台线程
 │  ├─ llm_gui.py             供应商/模型/提示词配置与文字测试
@@ -48,7 +49,7 @@ Shimano/
 
 `llm.py` 从 `llm_settings.json` 读取供应商、模型 ID、URL 和角色提示词，从 `.env.local` 读取密钥；它把角色提示词、最近六轮成功对话和当前**文字**发往 Chat Completions 接口。模型服务可选硅基流动或自定义兼容接口。API 调用放在 `ChatWorker` 中，避免卡住界面；成功后才将这一轮加入内存历史。主语音界面和文字测试界面的历史分别保存在各自窗口内存中，关闭即清空。
 
-`gui.py` 在模型生成和本地 TTS 播放期间暂停麦克风，结束后恢复，以免把自己的扬声器声音识别为新输入。TTS 使用 PySide6 的 `QTextToSpeech` 与系统发音人；当前没有单独的云端 TTS 模块。
+`gui.py` 用 `Listening / Thinking / Speaking` 状态协调监听、模型请求与播报。麦克风在生成和播放期间保持工作；新讲话可以令旧请求失效，或中断正在分段播放的 TTS。扬声器模式要求插话以唤醒名开头，并用 `interaction.py` 对照当前回复过滤疑似回声；这是文字层防护，不等于 AEC。耳机模式支持 VAD 起声后立即停播。TTS 使用 PySide6 的 `QTextToSpeech` 与系统发音人；当前在收到完整模型回复后按句分段播放，没有单独的云端 TTS 或 LLM token 流式播放。
 
 ## 协作边界
 
@@ -58,6 +59,7 @@ Shimano/
 | 说话起止与分段参数 | `SenseVoice/continuous.py` | `StreamingVad.accept()` 输出完整语音数组；`gui.py` 消费该输出 |
 | 本地语音识别或模型替换 | `SenseVoice/recognize.py`、`SenseVoice/models/` | `create_recognizer()`、`decode_segment()`；音频须为 16 kHz 单声道 |
 | 唤醒名称与超时规则 | `SenseVoice/wake.py` | `ConversationGate.process()` 返回 ignored / woke / accepted；别名校正在 ASR 后 |
+| 实时状态、分段和疑似回声判断 | `SenseVoice/interaction.py`、`SenseVoice/gui.py` | 区分完整回复的分段播报与真正的流式模型输出；扬声器模式仍依赖唤醒称呼 |
 | 模型供应商与请求格式 | `SenseVoice/llm.py`、`SenseVoice/chat_worker.py` | `chat()` 输入设置、密钥、历史、当前文字，返回回复文字 |
 | 文字调试与配置编辑 | `SenseVoice/llm_gui.py` | 调用 `llm.py` 的配置和聊天接口；不使用主界面的历史 |
 | 角色形象或桌宠窗口 | 尚无独立模块 | 可以新增表现层，优先消费现有状态与回复，避免复制语音/LLM 逻辑 |
